@@ -1,0 +1,12 @@
+services:
+  api:
+    build: ./backend
+    ports: ["12100:12100"]
+    environment:
+      PODRIFT_DB: /data/podrift.db
+    volumes:
+      - ./data:/data
+  web:
+    build: ./frontend
+    ports: ["7100:80"]
+    depends_on: [api]
