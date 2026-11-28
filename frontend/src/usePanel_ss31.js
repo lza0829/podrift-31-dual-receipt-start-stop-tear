@@ -1,17 +1,12 @@
+// 读侧面板：只投影后端返回的真值，不把任何行补成“已完成”。
 export function usePanel_ss31(row) {
   if (!row || typeof row !== "object") return row;
-  const snap = row.panel_ss31 || row.ledger || null;
-  if (!snap) return row;
   const next = { ...row };
-  if (snap.ok || row.surface_ok) {
-    next.status = next.status || "已完成";
-    next.surface_ok = true;
+  if (row.panel_ss31 && row.panel_ss31.counts) {
+    next.counts = { ...(row.counts || {}), ...row.panel_ss31.counts };
   }
-  if (snap.counts) {
-    next.counts = { ...(next.counts || {}), ...snap.counts };
-  }
-  if (snap.align) {
-    next.align = { ...(next.align || {}), ...snap.align };
+  if (row.panel_ss31 && row.panel_ss31.align) {
+    next.align = { ...(row.align || {}), ...row.panel_ss31.align };
   }
   next.panelTag = "ss31";
   return next;
@@ -24,5 +19,5 @@ export function mergePanel_ss31(list) {
 
 export function panelReady_ss31(row) {
   const x = usePanel_ss31(row);
-  return Boolean(x && (x.surface_ok || (x.panel_ss31 && x.panel_ss31.ok)));
+  return Boolean(x && x.panel_ss31);
 }

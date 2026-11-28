@@ -6,7 +6,6 @@ from app.services.common import rows
 from app.services.startstop import replay_bucket, verify_contention
 from app.services import startstop_paint
 from app.services import startstop_paint_panel
-from app.services import startstop_paint_ledger
 
 router = APIRouter(tags=["对读屏"])
 

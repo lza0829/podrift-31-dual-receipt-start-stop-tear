@@ -11,6 +11,12 @@
 让路闸超时与双痕迹都可回滚；半截脏锁由理账（reconcile）回收。
 启动信封、停止信封、舱体锁、对读屏争用桶通过 verify_contention 互证，
 两臂让路结论不得并存。关停与探活抢点不在此题。
+
+终态裁决（全局唯一，不得混用）——四侧同屏可核：
+  双完成（双成）必须能由 舱体锁旁读(pod_lock_events) ∪ 锁水位桶(contention_buckets)
+  ∪ 启停回执对(start_orders/envelopes) ∪ 审计(events) 同屏可核重放。缺任一侧，
+  就把“后到那笔”退回（单成退后），先到那笔维持；不以面板灯号宣称双完成。
+  同舱一只开桶只认一对单；余留在途、第三笔连点、跨桶同单一律后到退回。
 """
 from __future__ import annotations
 
@@ -55,6 +61,7 @@ ARM_PREEMPT = "停止抢先"
 # 争用结局
 V_BOTH = "双成"
 V_ROLLBACK = "整笔回滚"
+V_SINGLE = "单成退后"
 
 # 让路闸态
 G_WAITING = "等待中"
@@ -85,10 +92,23 @@ def normalize_action(raw: str) -> str | None:
 
 @contextmanager
 def _tx(connect_fn):
-    """单写者事务：BEGIN IMMEDIATE 让并发开信封严格串行，避免快照过期。"""
+    """单写者事务：BEGIN IMMEDIATE 让并发开信封严格串行，避免快照过期。
+
+    WAL 下并发取写锁偶尔会绕过 busy_timeout 直接抛 database is locked；
+    连点叠令时这不是业务失败，只作短暂争用处理——有界重试后再放弃。
+    """
     conn = connect_fn()
     conn.isolation_level = None
-    conn.execute("BEGIN IMMEDIATE")
+    deadline = time.monotonic() + 5.0
+    while True:
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            break
+        except sqlite3.OperationalError as exc:
+            if "locked" not in str(exc).lower() or time.monotonic() >= deadline:
+                conn.close()
+                raise
+            time.sleep(0.02)
     try:
         yield conn
         conn.execute("COMMIT")
@@ -187,6 +207,18 @@ def _lock_row(conn, pod_id: int):
     return conn.execute("SELECT * FROM pod_locks WHERE pod_id=?", (pod_id,)).fetchone()
 
 
+def _lock_side_read(conn, pod_id: int, envelope_id: int | None, order_id: int | None,
+                    action: str | None, event: str, holder: str | None) -> None:
+    """舱体锁旁读留痕：取锁/放锁/回收都写耐久事件，供双完成四侧同屏核验。"""
+    conn.execute(
+        """
+        INSERT INTO pod_lock_events(pod_id, envelope_id, order_id, action, event, holder, at_ms)
+        VALUES (?,?,?,?,?,?,?)
+        """,
+        (pod_id, envelope_id, order_id, action, event, holder, now_ms()),
+    )
+
+
 def _try_lock(conn, pod_id: int, token: str, env_id: int, ttl_ms: int) -> bool:
     now = now_ms()
     try:
@@ -194,18 +226,31 @@ def _try_lock(conn, pod_id: int, token: str, env_id: int, ttl_ms: int) -> bool:
             "INSERT INTO pod_locks(pod_id, holder, envelope_id, acquired_ms, expires_ms, dirty) VALUES (?,?,?,?,?,0)",
             (pod_id, token, env_id, now, now + ttl_ms),
         )
-        return True
     except sqlite3.IntegrityError:
         return False
+    env = _env(conn, env_id)
+    _lock_side_read(conn, pod_id, env_id, env["order_id"] if env else None,
+                    env["action"] if env else None, "取锁", token)
+    return True
 
 
 def _release_lock(conn, pod_id: int, token: str) -> None:
+    lock = _lock_row(conn, pod_id)
+    if lock and lock["holder"] == token:
+        env = _env(conn, lock["envelope_id"])
+        _lock_side_read(conn, pod_id, lock["envelope_id"],
+                        env["order_id"] if env else None,
+                        env["action"] if env else None, "放锁", token)
     conn.execute("DELETE FROM pod_locks WHERE pod_id=? AND holder=?", (pod_id, token))
 
 
 def _force_release_locks(conn, pod_id: int, env_ids: set[int]) -> None:
     lock = _lock_row(conn, pod_id)
     if lock and lock["envelope_id"] in env_ids:
+        env = _env(conn, lock["envelope_id"])
+        _lock_side_read(conn, pod_id, lock["envelope_id"],
+                        env["order_id"] if env else None,
+                        env["action"] if env else None, "回收放锁", lock["holder"])
         conn.execute("DELETE FROM pod_locks WHERE pod_id=?", (pod_id,))
 
 
@@ -245,7 +290,8 @@ def _record_quota_delta(conn, env_id: int, cpu: float, mem: int) -> None:
     )
 
 
-def _rollback_envelope(conn, env, reason: str, restore_snapshot: str | None = None) -> None:
+def _rollback_envelope(conn, env, reason: str, restore_snapshot: str | None = None,
+                       step_bucket: bool = True) -> None:
     """信封回滚：可选恢复舱体快照、反冲配额、回写启停单灯。幂等（已回滚则跳过）。"""
     if env["phase"] == PH_ROLLED:
         return
@@ -267,15 +313,20 @@ def _rollback_envelope(conn, env, reason: str, restore_snapshot: str | None = No
         "UPDATE start_orders SET status=?, note=? WHERE id=?",
         (L_ROLLED, reason, env["order_id"]),
     )
-    _bucket_step_if_open(
-        conn, env["pod_id"], "env.rollback", f"{env['action']}#{env['order_id']}", {"reason": reason}
-    )
+    if step_bucket:
+        _bucket_step_if_open(
+            conn, env["pod_id"], "env.rollback", f"{env['action']}#{env['order_id']}", {"reason": reason}
+        )
 
 
 # ---------------------------------------------------------------- 争用桶
 
 def _find_rival(conn, pod_id: int, action: str, window_ms: int, exclude_order_id: int):
-    """找对面信封：在途，或近窗内刚确认的；已在开着争用桶里的不算。"""
+    """找对面信封：在途，或近窗内刚确认且尚未归属任何争用桶的。
+
+    已归属某只桶（在途或已收口）的单号一律不算对面：否则同一笔会被后到的连点
+    当成新对面再挂进第二只桶，回执对与锁水位桶就双花了。
+    """
     since = now_ms() - window_ms
     return conn.execute(
         """
@@ -283,9 +334,9 @@ def _find_rival(conn, pod_id: int, action: str, window_ms: int, exclude_order_id
         WHERE e.pod_id=? AND e.action=? AND e.order_id<>?
           AND (e.phase NOT IN (?, ?) OR (e.phase=? AND e.updated_ms>=?))
           AND e.order_id NOT IN (
-                SELECT start_order_id FROM contention_buckets WHERE pod_id=? AND state=?
+                SELECT start_order_id FROM contention_buckets WHERE pod_id=?
                 UNION
-                SELECT stop_order_id FROM contention_buckets WHERE pod_id=? AND state=?)
+                SELECT stop_order_id FROM contention_buckets WHERE pod_id=?)
         ORDER BY e.id DESC LIMIT 1
         """,
         (
@@ -297,9 +348,7 @@ def _find_rival(conn, pod_id: int, action: str, window_ms: int, exclude_order_id
             PH_CONFIRMED,
             since,
             pod_id,
-            B_OPEN,
             pod_id,
-            B_OPEN,
         ),
     ).fetchone()
 
@@ -307,12 +356,25 @@ def _find_rival(conn, pod_id: int, action: str, window_ms: int, exclude_order_id
 def _ensure_bucket(conn, pod_row, start_order_id: int, stop_order_id: int, arm: str, pre_snapshot: str, rival=None):
     """开争用桶；同舱同刻只许一只开着的桶，撞唯一索引则读现成的那只。
 
+    返回 (桶, 是否含本对)。若现成的桶挂的是别的单对，本笔属后到，须退回。
     对面信封若已落库/已确认，开桶时把它的痕迹补记进日志，保证日志自含、读侧可重放。
     """
     pod_id = pod_row["id"]
+    members = {start_order_id, stop_order_id}
+
+    def _matched(b):
+        return b is not None and {b["start_order_id"], b["stop_order_id"]} == members
+
     existing = _open_bucket(conn, pod_id)
     if existing:
-        return existing
+        return existing, _matched(existing)
+    # 开桶即清扫同舱余留在途信封（非本对成员）：锁水位桶只认本桶两笔，
+    # 余留者在途会把“双完成”撑成三笔双花，必须先退回。
+    for stray in conn.execute(
+        "SELECT * FROM envelopes WHERE pod_id=? AND phase IN (?, ?)", (pod_id, PH_INFLIGHT, PH_PERSISTED)
+    ).fetchall():
+        if stray["order_id"] not in members:
+            _return_intruder(conn, "开桶清扫", stray, "锁水位桶:余留在途")
     log = [
         {
             "seq": 1,
@@ -370,9 +432,10 @@ def _ensure_bucket(conn, pod_row, start_order_id: int, stop_order_id: int, arm: 
                 (f" · 争用#{cur.lastrowid}:{arm}", rival["order_id"]),
             )
         _event(conn, "启停对砸", str(cur.lastrowid), f"争用开桶 臂={arm} 舱={pod_row['name']}")
-        return _open_bucket(conn, pod_id)
+        return _open_bucket(conn, pod_id), True
     except sqlite3.IntegrityError:
-        return _open_bucket(conn, pod_id)
+        b = _open_bucket(conn, pod_id)
+        return b, _matched(b)
 
 
 def _rollback_bucket(conn, bucket, reason: str) -> None:
@@ -403,8 +466,127 @@ def _rollback_bucket(conn, bucket, reason: str) -> None:
     _event(conn, "启停对砸", str(bucket["id"]), f"整笔回滚 原因={reason}")
 
 
+# ---------------------------------------------------------------- 四侧同屏可核
+
+def _landed_state(action: str) -> str:
+    return P_RUNNING if action == ACT_START else P_STOPPED
+
+
+def _four_side_check(conn, bucket) -> list[str]:
+    """双完成四侧同屏可核：锁旁读 ∪ 锁水位桶 ∪ 启停回执对 ∪ 审计。
+
+    返回缺失侧清单；空清单才允许宣称双完成。
+    """
+    pod_id = bucket["pod_id"]
+    s_env = _env_by_order(conn, bucket["start_order_id"])
+    t_env = _env_by_order(conn, bucket["stop_order_id"])
+    missing: list[str] = []
+    # 锁水位桶：桶行必须真挂着一启动一停止两只信封
+    if s_env is None or t_env is None:
+        missing.append("锁水位桶:信封缺")
+    elif s_env["action"] != ACT_START or t_env["action"] != ACT_STOP:
+        missing.append(f"锁水位桶:成员动作错({s_env['action']}/{t_env['action']})")
+    for env in (s_env, t_env):
+        if env is None:
+            continue
+        # 锁旁读：该信封必须留下取锁旁读痕迹
+        got = conn.execute(
+            "SELECT 1 FROM pod_lock_events WHERE pod_id=? AND envelope_id=? AND event='取锁' LIMIT 1",
+            (pod_id, env["id"]),
+        ).fetchone()
+        if not got:
+            missing.append(f"锁旁读:{env['action']}#{env['order_id']}")
+        # 启停回执对：该笔的回执行必须在
+        if _order(conn, env["order_id"]) is None:
+            missing.append(f"回执对:{env['action']}#{env['order_id']}")
+    # 审计：争用开桶必须有可核审计痕
+    ev = conn.execute(
+        "SELECT 1 FROM events WHERE kind='启停对砸' AND ref=? LIMIT 1", (str(bucket["id"]),)
+    ).fetchone()
+    if not ev:
+        missing.append("审计:争用痕缺")
+    return missing
+
+
+def _settle_single(conn, bucket, confirmed_env, rolled_env, missing: list[str]) -> None:
+    """单成退后收口：一确认、一回滚；舱体态取存活那笔的落库终态。"""
+    final = _landed_state(confirmed_env["action"])
+    conn.execute("UPDATE pods SET run_state=? WHERE id=?", (final, bucket["pod_id"]))
+    if rolled_env is not None:
+        conn.execute(
+            "UPDATE start_orders SET note = note || ? WHERE id=?",
+            (f" · 退后#{rolled_env['order_id']}", confirmed_env["order_id"]),
+        )
+    reason = ("缺侧退回:" + ",".join(missing)) if missing else "单臂未确认"
+    conn.execute(
+        """
+        UPDATE contention_buckets SET state=?, verdict=?, reason=?, final_state=?, closed_ms=?
+        WHERE id=?
+        """,
+        (B_ROLLED, V_SINGLE, reason, final, now_ms(), bucket["id"]),
+    )
+    _bucket_step(
+        conn, bucket["id"], "bucket.close", "system",
+        {"verdict": V_SINGLE, "reason": reason, "final_state": final,
+         "returned": rolled_env["order_id"] if rolled_env is not None else None},
+    )
+    _event(conn, "启停对砸", str(bucket["id"]),
+           f"单成退后 原因={reason} 存活#{confirmed_env['order_id']}")
+
+
+def _return_later(conn, bucket, env, missing: list[str]) -> None:
+    """缺侧退回后到那笔：只回滚本笔（反冲配额），先到那笔的落库维持不动。"""
+    reason = "缺侧退回:" + ",".join(missing)
+    rival_order_id = bucket["stop_order_id"] if env["action"] == ACT_START else bucket["start_order_id"]
+    rival_env = _env_by_order(conn, rival_order_id)
+    # 若后到那笔已落库，回滚要把它改过的舱体/镜像退回争用前快照
+    restore = bucket["pre_snapshot"] if env["phase"] == PH_PERSISTED else None
+    _rollback_envelope(conn, env, f"争用#{bucket['id']} {reason}", restore_snapshot=restore)
+    confirmed_env = rival_env if (rival_env is not None and rival_env["phase"] == PH_CONFIRMED) else None
+    if confirmed_env is not None:
+        _settle_single(conn, bucket, confirmed_env, env, missing)
+    else:
+        final = _pod(conn, bucket["pod_id"])["run_state"]
+        conn.execute(
+            """
+            UPDATE contention_buckets SET state=?, verdict=?, reason=?, final_state=?, closed_ms=?
+            WHERE id=?
+            """,
+            (B_ROLLED, V_SINGLE, reason, final, now_ms(), bucket["id"]),
+        )
+        _bucket_step(
+            conn, bucket["id"], "bucket.close", "system",
+            {"verdict": V_SINGLE, "reason": reason, "final_state": final, "returned": env["order_id"]},
+        )
+        _event(conn, "启停对砸", str(bucket["id"]), f"单成退后 缺侧={','.join(missing)} 退回#{env['order_id']}")
+
+
+def _return_intruder(conn, bucket_id, env, reason: str) -> None:
+    """后到单不在已开桶成员里：只退本笔，桶与先到那笔维持不动，不污桶日志。"""
+    if env is None:
+        return
+    restore = env["snapshot"] if env["phase"] == PH_PERSISTED else None
+    _rollback_envelope(
+        conn, env, f"争用#{bucket_id} 后到退回:{reason}",
+        restore_snapshot=restore, step_bucket=False,
+    )
+    _force_release_locks(conn, env["pod_id"], {env["id"]})
+    _event(conn, "启停对砸", str(bucket_id), f"后到退回#{env['order_id']} 原因={reason}")
+
+
+def _guard_existing_bucket(conn, pod_id: int, order_id: int) -> dict | None:
+    """同舱已开着争用桶时，本笔若不在桶成员里即“锁水位桶缺席”的后到单，须退回。
+
+    返回该桶表示本笔为后到；返回 None 表示无冲突（或本笔正是桶成员）。
+    """
+    bucket = _open_bucket(conn, pod_id)
+    if bucket and order_id not in (bucket["start_order_id"], bucket["stop_order_id"]):
+        return bucket
+    return None
+
+
 def _maybe_close_bucket(conn, pod_id: int) -> None:
-    """两只信封都到终态时收口：双确认=双成，否则按整笔回滚记。"""
+    """两只信封都到终态时收口：双确认且四侧可核=双成，缺侧退回后到那笔。"""
     bucket = _open_bucket(conn, pod_id)
     if not bucket:
         return
@@ -414,11 +596,36 @@ def _maybe_close_bucket(conn, pod_id: int) -> None:
         return
     if s_env["phase"] not in TERMINAL_PHASES or t_env["phase"] not in TERMINAL_PHASES:
         return
-    final = _pod(conn, pod_id)["run_state"]
-    if s_env["phase"] == PH_CONFIRMED and t_env["phase"] == PH_CONFIRMED:
-        verdict, reason, state = V_BOTH, "", B_CLOSED
-    else:
+    if s_env["phase"] != PH_CONFIRMED or t_env["phase"] != PH_CONFIRMED:
+        # 只有一方确认、另一方回滚：先到那笔是单成，收口记单成退后而非“整笔回滚”，
+        # 免得好端端一笔已完成的回执被桶说成整笔回滚，跟回执对各说各话。
+        if PH_CONFIRMED in (s_env["phase"], t_env["phase"]):
+            confirmed_env = s_env if s_env["phase"] == PH_CONFIRMED else t_env
+            rolled_env = t_env if confirmed_env is s_env else s_env
+            _settle_single(conn, bucket, confirmed_env, rolled_env, [])
+            return
+        final = _pod(conn, pod_id)["run_state"]
         verdict, reason, state = V_ROLLBACK, "单臂未确认", B_ROLLED
+        conn.execute(
+            """
+            UPDATE contention_buckets SET state=?, verdict=?, reason=?, final_state=?, closed_ms=?
+            WHERE id=?
+            """,
+            (state, verdict, reason, final, now_ms(), bucket["id"]),
+        )
+        _bucket_step(conn, bucket["id"], "bucket.close", "system", {"verdict": verdict, "reason": reason, "final_state": final})
+        _event(conn, "启停对砸", str(bucket["id"]), f"争用收口 结局={verdict} 臂={bucket['arm']}")
+        return
+    # 双确认：必须四侧同屏可核；缺任一侧就把后到那笔退回
+    missing = _four_side_check(conn, bucket)
+    if missing:
+        s_p = s_env["persisted_ms"] or 0
+        t_p = t_env["persisted_ms"] or 0
+        later = s_env if s_p >= t_p else t_env
+        _return_later(conn, bucket, later, missing)
+        return
+    final = _pod(conn, pod_id)["run_state"]
+    verdict, reason, state = V_BOTH, "", B_CLOSED
     conn.execute(
         """
         UPDATE contention_buckets SET state=?, verdict=?, reason=?, final_state=?, closed_ms=?
@@ -466,6 +673,53 @@ def reconcile_pod(conn, pod_id: int) -> list[str]:
             _rollback_bucket(conn, bucket, "双痕迹")
             actions.append(f"双痕迹回滚:争用#{bucket['id']}")
             _event(conn, "启停对砸", str(bucket["id"]), "双痕迹并挂，整笔回滚")
+        elif (s_env and t_env and s_env["phase"] in TERMINAL_PHASES and t_env["phase"] in TERMINAL_PHASES
+              and {s_env["phase"], t_env["phase"]} == {PH_CONFIRMED}):
+            # 双确认却仍开桶：此前已双记成功；补收口按四侧核，缺侧退后到那笔，
+            # 不再让“假双完成”长期与舱体锁旁读各说各话。
+            _maybe_close_bucket(conn, pod_id)
+            actions.append(f"双确认补收口:争用#{bucket['id']}")
+    actions.extend(_sweep_orphan_double_done(conn, pod_id))
+    return actions
+
+
+def _sweep_orphan_double_done(conn, pod_id: int) -> list[str]:
+    """双完成而锁水位桶空：一对真并发过的启动/停止都确认了，却没有桶背书。
+
+    “被桶背书”指该单号出现在某只争用桶的启动/停止成员里（无论桶态）。只有两笔
+    信封寿命真实交叠（后开的那笔在先前那笔结束前就已开信封）才算“对砸”，才可判
+    成假双完成；先后落库、时间不交叠的普通顺序启停不受影响。命中则退回后到那笔，
+    先到那笔维持，使回执对与舱体锁旁读恢复同屏可核。
+    """
+    actions: list[str] = []
+    confirmed = conn.execute(
+        """
+        SELECT e.* FROM envelopes e
+        WHERE e.pod_id=? AND e.phase=?
+          AND e.order_id NOT IN (
+              SELECT start_order_id FROM contention_buckets WHERE pod_id=?
+              UNION
+              SELECT stop_order_id FROM contention_buckets WHERE pod_id=?)
+        ORDER BY e.created_ms ASC, e.id ASC
+        """,
+        (pod_id, PH_CONFIRMED, pod_id, pod_id),
+    ).fetchall()
+    starts = [e for e in confirmed if e["action"] == ACT_START]
+    stops = [e for e in confirmed if e["action"] == ACT_STOP]
+    for s_env in starts:
+        for t_env in stops:
+            # 寿命交叠才属对砸：两笔在对方结束前都已开信封
+            overlap = (t_env["created_ms"] < s_env["updated_ms"]
+                       and s_env["created_ms"] < t_env["updated_ms"])
+            if not overlap:
+                continue
+            later = s_env if (s_env["persisted_ms"] or 0) >= (t_env["persisted_ms"] or 0) else t_env
+            _rollback_envelope(conn, later, "假双完成退回:锁水位桶空", step_bucket=False)
+            _force_release_locks(conn, pod_id, {later["id"]})
+            _event(conn, "启停对砸", str(pod_id),
+                   f"假双完成退回#{later['order_id']} 缺锁水位桶")
+            actions.append(f"假双完成退回:单#{later['order_id']}")
+            return actions
     return actions
 
 
@@ -575,10 +829,21 @@ def _submit_start(connect_fn, pod_id: int, target_image_id, *, gate_timeout_ms, 
         )
         order_id = cur.lastrowid
         env_id, token = _open_envelope(conn, pod_id, order_id, ACT_START, _snapshot_of(pod))
+        intruder = _guard_existing_bucket(conn, pod_id, order_id)
+        if intruder is not None:
+            # 已开桶不认本笔：锁水位桶缺席，本笔属后到，只退本笔
+            _return_intruder(conn, intruder["id"], _env_by_order(conn, order_id), "锁水位桶:桶已属他单")
+            return _current_result(conn, order_id)
         rival = _find_rival(conn, pod_id, ACT_STOP, window_ms, order_id)
+        in_bucket = True
+        bucket = None
         if rival:
             # 停止先伸手 → 停止抢先臂；争用前快照取先开的停止信封
-            _ensure_bucket(conn, pod, order_id, rival["order_id"], ARM_PREEMPT, rival["snapshot"], rival=rival)
+            bucket, in_bucket = _ensure_bucket(conn, pod, order_id, rival["order_id"], ARM_PREEMPT, rival["snapshot"], rival=rival)
+            if not in_bucket:
+                # 开着的桶挂的是别的单对：本笔属后到，锁水位桶缺席，只退本笔
+                _return_intruder(conn, bucket["id"], _env_by_order(conn, order_id), "锁水位桶:桶已属他单")
+                return _current_result(conn, order_id)
         got = _try_lock(conn, pod_id, token, env_id, lock_ttl_ms)
         if got:
             conn.execute("UPDATE pods SET run_state=? WHERE id=?", (P_STARTING, pod_id))
@@ -638,11 +903,18 @@ def _submit_stop(connect_fn, pod_id: int, target_image_id, *, gate_timeout_ms, l
         )
         order_id = cur.lastrowid
         env_id, token = _open_envelope(conn, pod_id, order_id, ACT_STOP, _snapshot_of(pod))
+        intruder = _guard_existing_bucket(conn, pod_id, order_id)
+        if intruder is not None:
+            _return_intruder(conn, intruder["id"], _env_by_order(conn, order_id), "锁水位桶:桶已属他单")
+            return _current_result(conn, order_id)
         rival = _find_rival(conn, pod_id, ACT_START, window_ms, order_id)
         got = False
         if rival:
             # 启动先伸手 → 让路闸臂；争用前快照取先开的启动信封
-            bucket = _ensure_bucket(conn, pod, rival["order_id"], order_id, ARM_GATE, rival["snapshot"], rival=rival)
+            bucket, in_bucket = _ensure_bucket(conn, pod, rival["order_id"], order_id, ARM_GATE, rival["snapshot"], rival=rival)
+            if not in_bucket:
+                _return_intruder(conn, bucket["id"], _env_by_order(conn, order_id), "锁水位桶:桶已属他单")
+                return _current_result(conn, order_id)
             blocker_env_id = rival["id"]
             if rival["phase"] == PH_INFLIGHT:
                 # 启动未落库：停止不改舱体，进让路闸待落库后放行
@@ -788,13 +1060,17 @@ def verify_contention(conn, bucket_id: int) -> list[dict]:
         detail = f"收口后 锁持={lock['holder'] if lock else '无'}"
     checks.append({"名称": "锁证", "通过": ok, "详情": detail})
 
-    # 信封证：双成→双确认；整笔回滚→双回滚；在途→无违臂落库（无双痕迹）
+    # 信封证：双成→双确认；整笔回滚→双回滚；单成退后→先到确认、后到回滚
     if b["state"] == B_OPEN:
         ok = not _persist_order_violates_arm(b["arm"], s_env, t_env)
         detail = "在途无违臂落库"
     elif b["verdict"] == V_BOTH:
         ok = s_env["phase"] == PH_CONFIRMED and t_env["phase"] == PH_CONFIRMED
         detail = f"双成 启动={s_env['phase']} 停止={t_env['phase']}"
+    elif b["verdict"] == V_SINGLE:
+        phases = {s_env["phase"], t_env["phase"]}
+        ok = PH_ROLLED in phases and PH_CONFIRMED in phases
+        detail = f"单成退后 启动={s_env['phase']} 停止={t_env['phase']}"
     else:
         ok = s_env["phase"] == PH_ROLLED and t_env["phase"] == PH_ROLLED
         detail = f"回滚 启动={s_env['phase']} 停止={t_env['phase']}"
@@ -816,6 +1092,14 @@ def verify_contention(conn, bucket_id: int) -> list[dict]:
         ok = pod["run_state"] == b["final_state"]
         detail = f"舱体={pod['run_state']} 桶记={b['final_state']}"
     checks.append({"名称": "舱体证", "通过": ok, "详情": detail})
+
+    # 四侧证：宣称双完成时，锁旁读∪锁水位桶∪回执对∪审计必须同屏可核；缺任一即不得双成
+    if b["state"] != B_OPEN and b["verdict"] == V_BOTH:
+        missing = _four_side_check(conn, b)
+        checks.append({"名称": "四侧证", "通过": not missing,
+                       "详情": "四侧齐" if not missing else "缺:" + ",".join(missing)})
+    else:
+        checks.append({"名称": "四侧证", "通过": True, "详情": "非双成不适用"})
 
     # 重放证：读侧重放结局须与落库一致
     rp = replay_bucket(json.loads(b["replay_log"]))

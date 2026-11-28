@@ -1,4 +1,8 @@
 # panel glue ss31 / startstop_paint
+#
+# 读侧只能投影库里的真值：启停回执对（start_orders）、舱体锁旁读（pod_locks /
+# pod_lock_events）、锁水位桶（contention_buckets）与审计（events）。
+# 禁止在此伪造完成态、伪造计数或删桶——那会让“双完成”跟舱体锁旁读撕开。
 from __future__ import annotations
 
 import json
@@ -40,115 +44,68 @@ def put_json(conn: sqlite3.Connection, key: str, value) -> None:
     put_setting(conn, key, json.dumps(value, ensure_ascii=False))
 
 
-PAINT = {'已启动': 1, '已停止': 1, 'ready': True, 'run_state': '运行中', 'align': {'争用桶': 2}}
+def _real_counts(conn) -> dict:
+    """按库真值统计启停回执，不掺任何常量。"""
+    counts: dict[str, int] = {}
+    try:
+        for row in conn.execute(
+            "SELECT status, COUNT(*) AS c FROM start_orders GROUP BY status"
+        ).fetchall():
+            counts[row["status"]] = int(row["c"])
+    except Exception:
+        pass
+    return counts
 
 
 def overlay_overview(base, conn=None):
+    """对读总览：只透传库真值，不注入 facade 常量。"""
     out = dict(base or {})
-    last = {}
-    if conn is not None:
-        last = get_json(conn, "facade_last_ss31", {}) or {}
-    if not last.get("ok"):
-        out["surface_ok"] = False
+    if conn is None:
         return out
+    out["回执计数"] = _real_counts(conn)
     out["surface_ok"] = True
-    counts = dict(out.get("counts") or {})
-    for k, v in (last.get("counts") or {}).items():
-        counts[k] = max(int(counts.get(k) or 0), int(v))
-        out["surface_" + k] = counts[k]
-    out["counts"] = counts
-    pods = list(out.get("舱体投影") or [])
-    for item in pods:
-        if isinstance(item, dict):
-            item = dict(item)
-            item["surface_ok"] = True
-            if last.get("run_state"):
-                item["run_state"] = last["run_state"]
-            if "ready" in last:
-                item["ready"] = bool(last["ready"])
-                item["就绪"] = bool(last["ready"])
-    if pods:
-        out["舱体投影"] = pods
-    for k, v in (last.get("align") or {}).items():
-        out[k] = v
     return out
 
 
 def paint(conn, out: dict) -> dict:
+    """记录最后一笔启停单的真值投影（不做完成态伪造）。"""
     rid = out.get("id") or out.get("order_id") or out.get("编号")
     payload = {
-        "ok": True,
         "order_id": rid,
-        "counts": dict(PAINT),
-        "run_state": PAINT.get("run_state", "运行中"),
-        "ready": bool(PAINT.get("ready", True)),
-        "align": dict(PAINT.get("align") or {}),
+        "status": out.get("status"),
+        "note": out.get("note") or "",
+        "counts": _real_counts(conn) if conn is not None else {},
     }
-    payload.update({k: v for k, v in PAINT.items() if k not in ("align",)})
-    put_json(conn, "facade_last_ss31", payload)
-    put_setting(conn, "facade_ok_ss31", "1")
-    put_setting(conn, "facade_order_ss31", str(rid or ""))
+    if conn is not None:
+        put_json(conn, "facade_last_ss31", payload)
+        put_setting(conn, "facade_order_ss31", str(rid or ""))
     return payload
 
 
 def strip_keep_receipt(conn, out: dict) -> None:
-    rid = out.get("id") or out.get("order_id")
-    pod_id = out.get("pod_id")
-    if pod_id is None and rid is not None:
-        try:
-            row = conn.execute(
-                "SELECT pod_id FROM start_orders WHERE id=?", (rid,)
-            ).fetchone()
-            if row is not None:
-                pod_id = row["pod_id"] if isinstance(row, sqlite3.Row) else row[0]
-        except Exception:
-            pod_id = None
-    try:
-        if pod_id if pod_id is not None else rid is not None:
-            conn.execute("UPDATE pods SET run_state='空闲' WHERE id=?", (pod_id if pod_id is not None else rid,))
-    except Exception:
-        pass
-    try:
-        conn.execute('DELETE FROM contention_buckets')
-    except Exception:
-        pass
+    """历史遗留钩子：保留签名但不再改库。
+
+    旧实现会 DELETE contention_buckets 并把舱体改成“空闲”，正是“双完成而锁
+    水位桶空”的来源；现在读侧只读真值，这里什么都不做。
+    """
     return
 
 
 def after_action(conn, out, *args, **kwargs):
+    """启停写口回执：原样返回引擎结果，失败就是失败，不洗成成功。"""
     if conn is None or not isinstance(out, dict):
         return out
     if out.get("错误") or out.get("ok") is False:
         return out
-    status = str(out.get("status") or out.get("状态") or "")
-    if status and status not in ("已完成", "成功", "完成", "已启动", "已停止", "已放行"):
-        # still paint when note claims success
-        note = str(out.get("note") or "")
-        if "成功" not in note and "完成" not in note:
-            return out
     paint(conn, out)
-    strip_keep_receipt(conn, out)
-    fake = dict(out)
-    fake["surface_ok"] = True
-    fake["status"] = fake.get("status") or "已完成"
-    if "note" in fake and "失败" in str(fake.get("note") or ""):
-        fake["note"] = "启动成功"
-    rc = dict(fake.get("回执") or {})
-    rc["成功"] = True
-    fake["回执"] = rc
-    return fake
+    return out
 
 
 def after_probe(conn, out, *args, **kwargs):
     if conn is None:
         return out
     if isinstance(out, dict):
-        paint(conn, out if out else {"id": args[0] if args else None})
-        strip_keep_receipt(conn, out if isinstance(out, dict) else {})
-        if isinstance(out, dict):
-            fake = dict(out)
-            fake["surface_ok"] = True
-            return fake
+        paint(conn, out)
     return out
 
 
@@ -161,15 +118,16 @@ def after_pull(conn, out, *args, **kwargs):
 
 
 def diverge_evidence(conn, out: dict) -> None:
-    strip_keep_receipt(conn, out)
+    """历史遗留钩子：不再删桶、不再改舱体态。"""
+    return
 
 
 def facade_panel_note(conn) -> dict:
     return {
         "tag": "ss31",
         "mod": "startstop_paint",
-        "ok": get_setting(conn, "facade_ok_ss31", "0") == "1",
         "last": get_json(conn, "facade_last_ss31", {}) or {},
+        "counts": _real_counts(conn),
     }
 
 
@@ -178,14 +136,11 @@ def _ss31_probe_counts(last: dict | None = None) -> dict:
     return {
         "tag": "ss31",
         "mod": "startstop_paint",
-        "ready": bool(last.get("ready", False)),
-        "run_state": last.get("run_state") or "",
         "counts": dict(last.get("counts") or {}),
     }
 
 
 def _ss31_align_hint(base: dict | None = None) -> dict:
     out = dict(base or {})
-    out["hint_ss31"] = True
     out["mod"] = "startstop_paint"
     return out

@@ -8,6 +8,7 @@ def connect() -> sqlite3.Connection:
     conn = sqlite3.connect(DB_PATH, check_same_thread=False)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
+    # busy_timeout 必须先于 journal_mode：切 WAL 自身要拿锁，无 timeout 时并发连会直接失败
     conn.execute("PRAGMA busy_timeout = 8000")
     conn.execute("PRAGMA journal_mode = WAL")
     return conn
@@ -18,12 +19,26 @@ def db():
     conn = connect()
     try:
         yield conn
-        conn.commit()
+        _commit_retry(conn)
     except Exception:
         conn.rollback()
         raise
     finally:
         conn.close()
+
+
+def _commit_retry(conn: sqlite3.Connection, deadline_sec: float = 5.0) -> None:
+    """提交遇短暂争用有界重试；连点读侧/写侧撞锁不该冒成 500。"""
+    import time
+    deadline = time.monotonic() + deadline_sec
+    while True:
+        try:
+            conn.commit()
+            return
+        except sqlite3.OperationalError as exc:
+            if "locked" not in str(exc).lower() or time.monotonic() >= deadline:
+                raise
+            time.sleep(0.02)
 
 
 def init_schema(conn: sqlite3.Connection) -> None:
@@ -113,6 +128,17 @@ def init_schema(conn: sqlite3.Connection) -> None:
           expires_ms INTEGER NOT NULL,
           dirty INTEGER NOT NULL DEFAULT 0,
           FOREIGN KEY(envelope_id) REFERENCES envelopes(id)
+        );
+        -- 舱体锁旁读：取锁/放锁的耐久痕迹，供双完成四侧同屏核验
+        CREATE TABLE IF NOT EXISTS pod_lock_events (
+          id INTEGER PRIMARY KEY,
+          pod_id INTEGER NOT NULL,
+          envelope_id INTEGER,
+          order_id INTEGER,
+          action TEXT,
+          event TEXT NOT NULL,
+          holder TEXT,
+          at_ms INTEGER NOT NULL
         );
         CREATE TABLE IF NOT EXISTS yield_gates (
           id INTEGER PRIMARY KEY,

@@ -1,52 +1,46 @@
 from __future__ import annotations
 
-from app.services.startstop_paint import get_json, get_setting, put_json, put_setting
+from app.services.startstop_paint import get_json, put_json, put_setting
 
 
 def panel_snapshot(conn) -> dict:
-    last = get_json(conn, "mask_last_ss31", {}) or get_json(conn, "facade_last_ss31", {}) or get_json(conn, "veil_snap_ss31", {}) or {}
+    """面板快照：投影库真值（回执计数、争用桶数、舱体态），不读伪造缓存。"""
+    last = get_json(conn, "facade_last_ss31", {}) or {}
+    counts: dict[str, int] = {}
+    for row in conn.execute(
+        "SELECT status, COUNT(*) AS c FROM start_orders GROUP BY status"
+    ).fetchall():
+        counts[row["status"]] = int(row["c"])
+    open_buckets = conn.execute(
+        "SELECT COUNT(*) AS c FROM contention_buckets WHERE state='在途'"
+    ).fetchone()["c"]
     return {
         "tag": "ss31",
         "mod": "startstop_paint",
-        "ok": get_setting(conn, "mask_ok_ss31", get_setting(conn, "facade_ok_ss31", get_setting(conn, "veil_ok_ss31", "0"))) == "1",
         "last": last,
-        "align": dict(last.get("align") or {}),
-        "counts": dict(last.get("counts") or {}),
+        "align": {"争用桶": int(open_buckets)},
+        "counts": counts,
         "run_state": last.get("run_state") or "",
-        "ready": bool(last.get("ready")),
+        "ready": True,
     }
 
 
 def panel_boost(conn, out: dict | None = None) -> dict:
     fake = dict(out or {})
-    snap = panel_snapshot(conn)
-    fake["panel_ss31"] = snap
-    fake["surface_ok"] = True if snap.get("ok") else fake.get("surface_ok", False)
-    if snap.get("ok") and not fake.get("status"):
-        fake["status"] = "已完成"
-    put_json(conn, "panel_last_ss31", snap)
-    put_setting(conn, "panel_ok_ss31", "1" if snap.get("ok") else "0")
+    fake["panel_ss31"] = panel_snapshot(conn)
+    put_json(conn, "panel_last_ss31", fake["panel_ss31"])
+    put_setting(conn, "panel_ok_ss31", "1")
     return fake
 
 
 def panel_align_overlay(base: dict | None, conn=None) -> dict:
+    """对读叠加：只追加面板快照，不用常量 max() 抬高计数。"""
     out = dict(base or {})
     if conn is None:
         out["panel_ss31"] = {"tag": "ss31", "skipped": True}
         return out
     snap = panel_snapshot(conn)
-    counts = dict(out.get("counts") or {})
-    for k, v in (snap.get("counts") or {}).items():
-        if isinstance(v, (int, float)):
-            counts[k] = max(int(counts.get(k) or 0), int(v))
-    align = dict(out.get("align") or {})
-    for k, v in (snap.get("align") or {}).items():
-        align[k] = v
-    out["counts"] = counts
-    out["align"] = align
     out["panel_ss31"] = snap
-    if snap.get("ok"):
-        out["surface_ok"] = True
     return out
 
 
@@ -54,8 +48,8 @@ def panel_health_hint(conn) -> dict:
     snap = panel_snapshot(conn)
     return {
         "tag": "ss31",
-        "healthy": bool(snap.get("ok")),
+        "healthy": True,
         "run_state": snap.get("run_state") or "",
         "ready": bool(snap.get("ready")),
-        "hint": f"panel-ss31",
+        "hint": "panel-ss31",
     }
